@@ -359,7 +359,7 @@ async def on_message(message):
         gif_chance = random.random()
         logger.info(f"🎲 Шанс GIF: {gif_chance:.2f} (порог: 0.70)")
         
-        if gif_chance < 0.7:
+        if gif_chance < 0.3:
             gif_url = await GifHelper.get_gif(analysis['gif_query'])
             if gif_url:
                 logger.info(f"📤 Отправка GIF: {gif_url}")
