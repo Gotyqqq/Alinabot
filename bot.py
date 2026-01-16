@@ -130,7 +130,7 @@ class AIAssistant:
         try:
             logger.info("🤖 Отправка запроса к Gemma-2-27b...")
             response = gemini_client.models.generate_content(
-                model="gemma-2-27b-it",
+                model="ggemma-3-27b-it",
                 contents=analysis_prompt
             )
             
