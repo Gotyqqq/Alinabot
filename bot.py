@@ -107,7 +107,7 @@ class AIAssistant:
         
         try:
             response = gemini_client.models.generate_content(
-                model="gemma-2-27b-it",
+                model="gemma-3-27b",
                 contents=analysis_prompt
             )
             
