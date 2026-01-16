@@ -1,0 +1,9 @@
+.env
+chat_logs/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+venv/
+.vscode/
+.idea/
