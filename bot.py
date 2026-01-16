@@ -7,6 +7,9 @@ import aiohttp
 from datetime import datetime
 from google import genai
 from mistralai import Mistral
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Настройка intents для Discord
 intents = discord.Intents.default()
