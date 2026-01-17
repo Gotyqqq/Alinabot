@@ -4,11 +4,12 @@ import os
 import json
 import random
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta
 from google import genai
 from mistralai import Mistral
 from dotenv import load_dotenv
 import logging
+import asyncio
 
 # Настройка подробного логирования
 logging.basicConfig(
@@ -45,12 +46,22 @@ MAX_HISTORY = 50
 # Счетчик сообщений для каждого канала (для автоответов)
 channel_message_count = {}
 
+# Время последнего ответа в каждом канале (для кулдауна)
+channel_last_response = {}
+
+# Кулдаун в секундах (3 минуты = 180 секунд)
+COOLDOWN_SECONDS = 180
+
+# Блокировка для предотвращения одновременной обработки
+channel_processing_lock = {}
+
 # Системный промпт для персоны молодой девушки
 PERSONA_PROMPT = """Ты - молодая девушка, общаешься в Discord чате со своими друзьями. 
 Ты естественна, дружелюбна, используешь современный сленг и эмодзи. 
 Никогда не выдавай что ты бот или AI. Ты настоящий человек с эмоциями и мнениями.
 Пиши коротко и по теме, как обычная девушка в чате. Используй смайлики, но не перебарщивай.
-Отвечай на русском языке естественно и непринужденно."""
+Отвечай на русском языке естественно и непринужденно.
+ВАЖНО: Не повторяй одни и те же фразы, будь разнообразной в ответах."""
 
 class ChatLogger:
     """Класс для управления логами чатов"""
@@ -108,8 +119,8 @@ class AIAssistant:
         
         # Решаем отвечать ли на основе счетчика сообщений
         # Если упомянули - всегда отвечаем
-        # Иначе отвечаем раз в 3-4 сообщения (случайно)
-        auto_respond = is_mentioned or (message_count >= random.randint(3, 4))
+        # Иначе отвечаем раз в 5-7 сообщений (случайно)
+        auto_respond = is_mentioned or (message_count >= random.randint(5, 7))
         
         analysis_prompt = f"""Проанализируй следующий диалог в Discord чате:
 
@@ -128,7 +139,7 @@ class AIAssistant:
 {{"topic": "тема", "mood": "настроение", "should_respond": "да/нет", "tone": "тон", "gif_query": "запрос"}}"""
         
         try:
-            logger.info("🤖 Отправка запроса к Gemma-2-27b...")
+            logger.info("🤖 Отправка запроса к Gemini-1.5-Flash...")
             response = gemini_client.models.generate_content(
                 model="gemma-3-27b-it",
                 contents=analysis_prompt
@@ -136,7 +147,7 @@ class AIAssistant:
             
             # Парсим JSON из ответа
             response_text = response.text.strip()
-            logger.info(f"📥 Получен ответ от Gemma: {response_text[:100]}...")
+            logger.info(f"📥 Получен ответ от Gemini: {response_text[:100]}...")
             
             # Ищем JSON в ответе
             if '{' in response_text and '}' in response_text:
@@ -159,7 +170,7 @@ class AIAssistant:
             
             return analysis
         except Exception as e:
-            logger.error(f"❌ Ошибка анализа Gemma: {e}")
+            logger.error(f"❌ Ошибка анализа Gemini: {e}")
             return {
                 "topic": "общение",
                 "mood": "нейтральная",
@@ -198,7 +209,8 @@ class AIAssistant:
 
 {"Тебя упомянули - ответь более развернуто (2-3 предложения)." if is_mentioned else "Ответь коротко и естественно (1 короткое предложение или фраза)."}
 
-Помни: ты молодая девушка, общаешься с друзьями. Будь естественной, не выдавай что ты бот."""
+Помни: ты молодая девушка, общаешься с друзьями. Будь естественной, не выдавай что ты бот. 
+ВАЖНО: НЕ повторяй свои предыдущие ответы, будь разнообразной!"""
         
         context_messages.append({
             "role": "user",
@@ -208,15 +220,15 @@ class AIAssistant:
         try:
             logger.info("🤖 Отправка запроса к Mistral...")
             response = mistral_client.chat.complete(
-                model="mistral-small-latest",
+                model="mistral-large-2407",
                 messages=context_messages,
                 max_tokens=150 if is_mentioned else 50,
-                temperature=0.9
+                temperature=0.95
             )
             
             reply = response.choices[0].message.content.strip()
             # Убираем возможные префиксы имени бота
-            reply = reply.replace("Ассистент:", "").replace("Бот:", "").strip()
+            reply = reply.replace("Ассистент:", "").replace("Бот:", "").replace("Alina:", "").strip()
             
             logger.info(f"✅ Ответ сгенерирован: '{reply}'")
             return reply
@@ -227,7 +239,10 @@ class AIAssistant:
                 "согласна!",
                 "ну да)",
                 "интересно 🤔",
-                "ого"
+                "ого",
+                "правда?",
+                "понимаю",
+                "кстати да"
             ])
             logger.info(f"⚠️ Используем fallback ответ: '{fallback}'")
             return fallback
@@ -295,82 +310,114 @@ async def on_message(message):
     
     channel_id = str(message.channel.id)
     
-    logger.info("=" * 60)
-    logger.info(f"📨 Новое сообщение в канале {message.channel.name} ({channel_id})")
-    logger.info(f"👤 Автор: {message.author.name}")
-    logger.info(f"💬 Содержание: {message.content}")
+    # Инициализация блокировки для канала
+    if channel_id not in channel_processing_lock:
+        channel_processing_lock[channel_id] = asyncio.Lock()
     
-    # Сохраняем сообщение в лог
-    history = ChatLogger.save_message(
-        channel_id,
-        message.author.name,
-        message.content,
-        datetime.now().isoformat()
-    )
-    
-    # Увеличиваем счетчик сообщений для канала
-    if channel_id not in channel_message_count:
-        channel_message_count[channel_id] = 0
-    channel_message_count[channel_id] += 1
-    
-    # Проверяем упоминание бота
-    is_mentioned = bot.user.mentioned_in(message)
-    
-    if is_mentioned:
-        logger.info("🔔 Бот упомянут в сообщении!")
-    
-    # Анализируем контекст с помощью Gemma
-    analysis = await AIAssistant.analyze_context(
-        history,
-        message.content,
-        is_mentioned,
-        channel_message_count[channel_id]
-    )
-    
-    # Решаем, отвечать ли
-    should_respond = analysis['should_respond'].lower() == 'да'
-    
-    if not should_respond and not is_mentioned:
-        logger.info(f"⏭️ Пропускаем ответ. Счетчик сообщений: {channel_message_count[channel_id]}")
-        logger.info("=" * 60)
+    # Проверяем, не обрабатывается ли уже сообщение в этом канале
+    if channel_processing_lock[channel_id].locked():
+        logger.info(f"⏭️ Канал {channel_id} уже обрабатывает сообщение, пропускаем")
         return
     
-    # Сбрасываем счетчик после ответа
-    channel_message_count[channel_id] = 0
-    logger.info("🔄 Счетчик сообщений сброшен")
-    
-    # Показываем "печатает..."
-    logger.info("⌨️ Показываем статус 'печатает...'")
-    async with message.channel.typing():
-        # Генерируем ответ с помощью Mistral
-        response_text = await AIAssistant.generate_response(
-            analysis,
-            history,
+    # Блокируем канал на время обработки
+    async with channel_processing_lock[channel_id]:
+        logger.info("=" * 60)
+        logger.info(f"📨 Новое сообщение в канале {message.channel.name} ({channel_id})")
+        logger.info(f"👤 Автор: {message.author.name}")
+        logger.info(f"💬 Содержание: {message.content}")
+        
+        # Сохраняем сообщение в лог
+        history = ChatLogger.save_message(
+            channel_id,
+            message.author.name,
             message.content,
-            is_mentioned
+            datetime.now().isoformat()
         )
         
-        # Отправляем текстовый ответ
-        logger.info(f"📤 Отправка текстового ответа: '{response_text}'")
-        await message.channel.send(response_text)
-        logger.info("✅ Текстовый ответ отправлен")
+        # Увеличиваем счетчик сообщений для канала
+        if channel_id not in channel_message_count:
+            channel_message_count[channel_id] = 0
+        channel_message_count[channel_id] += 1
         
-        # 70% шанс отправить GIF (чтобы не спамить)
-        gif_chance = random.random()
-        logger.info(f"🎲 Шанс GIF: {gif_chance:.2f} (порог: 0.70)")
+        # Проверяем упоминание бота
+        is_mentioned = bot.user.mentioned_in(message)
         
-        if gif_chance < 0.3:
-            gif_url = await GifHelper.get_gif(analysis['gif_query'])
-            if gif_url:
-                logger.info(f"📤 Отправка GIF: {gif_url}")
-                await message.channel.send(gif_url)
-                logger.info("✅ GIF отправлен")
+        if is_mentioned:
+            logger.info("🔔 Бот упомянут в сообщении!")
+        
+        # КУЛДАУН: Проверяем время последнего ответа
+        current_time = datetime.now()
+        if channel_id in channel_last_response:
+            time_since_last = (current_time - channel_last_response[channel_id]).total_seconds()
+            
+            # Если не прошло 3 минуты И бот не упомянут - пропускаем
+            if time_since_last < COOLDOWN_SECONDS and not is_mentioned:
+                remaining = int(COOLDOWN_SECONDS - time_since_last)
+                logger.info(f"⏰ Кулдаун активен. Осталось {remaining} секунд. Пропускаем.")
+                logger.info("=" * 60)
+                return
+            elif is_mentioned:
+                logger.info("🔔 Упоминание игнорирует кулдаун")
+        
+        # Анализируем контекст с помощью Gemini
+        analysis = await AIAssistant.analyze_context(
+            history,
+            message.content,
+            is_mentioned,
+            channel_message_count[channel_id]
+        )
+        
+        # Решаем, отвечать ли
+        should_respond = analysis['should_respond'].lower() == 'да'
+        
+        if not should_respond and not is_mentioned:
+            logger.info(f"⏭️ Пропускаем ответ. Счетчик сообщений: {channel_message_count[channel_id]}")
+            logger.info("=" * 60)
+            return
+        
+        # Сбрасываем счетчик после ответа
+        channel_message_count[channel_id] = 0
+        logger.info("🔄 Счетчик сообщений сброшен")
+        
+        # Показываем "печатает..."
+        logger.info("⌨️ Показываем статус 'печатает...'")
+        async with message.channel.typing():
+            # Задержка для естественности
+            await asyncio.sleep(random.uniform(1.5, 3.0))
+            
+            # Генерируем ответ с помощью Mistral
+            response_text = await AIAssistant.generate_response(
+                analysis,
+                history,
+                message.content,
+                is_mentioned
+            )
+            
+            # Отправляем текстовый ответ
+            logger.info(f"📤 Отправка текстового ответа: '{response_text}'")
+            await message.channel.send(response_text)
+            logger.info("✅ Текстовый ответ отправлен")
+            
+            # Обновляем время последнего ответа
+            channel_last_response[channel_id] = datetime.now()
+            logger.info(f"⏰ Время последнего ответа обновлено для канала {channel_id}")
+            
+            # 30% шанс отправить GIF (уменьшено с 70%)
+            gif_chance = random.random()
+            logger.info(f"🎲 Шанс GIF: {gif_chance:.2f} (порог: 0.30)")
+            
+            if gif_chance < 0.30:
+                gif_url = await GifHelper.get_gif(analysis['gif_query'])
+                if gif_url:
+                    logger.info(f"📤 Отправка GIF: {gif_url}")
+                    await message.channel.send(gif_url)
+                    logger.info("✅ GIF отправлен")
+                else:
+                    logger.info("⏭️ GIF не найден, пропускаем")
             else:
-                logger.info("⏭️ GIF не найден, пропускаем")
-        else:
-            logger.info("⏭️ GIF не отправляем (не прошли шанс)")
-    
-    logger.info("=" * 60)
+                logger.info("⏭️ GIF не отправляем (не прошли шанс)")
+        
+        logger.info("=" * 60)
 
 @bot.command(name='clear_history')
 @commands.has_permissions(administrator=True)
@@ -388,6 +435,11 @@ async def clear_history(ctx):
     else:
         logger.info(f"⚠️ История канала {channel_id} уже пуста")
         await ctx.send("История чата уже пуста.")
+    
+    # Сброс кулдауна для этого канала
+    if channel_id in channel_last_response:
+        del channel_last_response[channel_id]
+        logger.info(f"🔄 Кулдаун сброшен для канала {channel_id}")
 
 @bot.command(name='ping')
 async def ping(ctx):
@@ -395,6 +447,18 @@ async def ping(ctx):
     latency = round(bot.latency * 1000)
     logger.info(f"🏓 Команда ping. Задержка: {latency}мс")
     await ctx.send(f'Понг! 🏓 Задержка: {latency}мс')
+
+@bot.command(name='reset_cooldown')
+@commands.has_permissions(administrator=True)
+async def reset_cooldown(ctx):
+    """Сбросить кулдаун для текущего канала (только для администраторов)"""
+    channel_id = str(ctx.channel.id)
+    if channel_id in channel_last_response:
+        del channel_last_response[channel_id]
+        logger.info(f"🔄 Кулдаун сброшен администратором для канала {channel_id}")
+        await ctx.send("✅ Кулдаун сброшен!")
+    else:
+        await ctx.send("Кулдаун не активен.")
 
 # Запуск бота
 if __name__ == "__main__":
