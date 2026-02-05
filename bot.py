@@ -23,6 +23,8 @@ AUTO_REPLY_MIN = 5
 AUTO_REPLY_MAX = 7
 COOLDOWN_SECONDS = 180
 GIF_PROBABILITY = 0.20            # уменьшим еще, чтобы было спокойнее
+DISCORD_MAX_MESSAGE_LENGTH = 2000   # лимит Discord на одно сообщение
+CHUNK_SEND_DELAY_SEC = 1.5       # задержка между частями длинного ответа (анти-спам)
 
 # =========================
 # ЛОГИ
@@ -241,6 +243,50 @@ class GifHelper:
 # HELPERS
 # =========================
 
+def _split_message(text: str, max_len: int = DISCORD_MAX_MESSAGE_LENGTH) -> list[str]:
+    """
+    Разбивает текст на части не длиннее max_len.
+    Старается резать по переносам строк, затем по пробелам.
+    """
+    if not text or len(text) <= max_len:
+        return [text] if text else []
+
+    chunks = []
+    rest = text
+
+    while rest:
+        if len(rest) <= max_len:
+            chunks.append(rest)
+            break
+        part = rest[:max_len]
+        # ищем последний перенос строки
+        last_nl = part.rfind("\n")
+        if last_nl > max_len // 2:  # режем по \n если не в самом начале
+            cut = last_nl + 1
+        else:
+            last_space = part.rfind(" ")
+            if last_space > max_len // 2:
+                cut = last_space + 1
+            else:
+                cut = max_len
+        chunks.append(rest[:cut].strip())
+        rest = rest[cut:].lstrip()
+    return chunks
+
+
+async def _send_long_message(channel, text: str):
+    """
+    Отправляет текст в канал с учётом лимита Discord.
+    Если не помещается — шлёт частями с задержкой между ними.
+    """
+    chunks = _split_message(text)
+    for i, chunk in enumerate(chunks):
+        if chunk:
+            await channel.send(chunk)
+            if i < len(chunks) - 1:
+                await asyncio.sleep(CHUNK_SEND_DELAY_SEC)
+
+
 def _cooldown_remaining(channel_id: str) -> int:
     if channel_id not in channel_last_response:
         return 0
@@ -368,7 +414,7 @@ async def on_message(message):
                 memory_block=memory_block
             )
 
-            await message.channel.send(reply)
+            await _send_long_message(message.channel, reply)
             channel_last_response[channel_id] = datetime.now()
 
             # GIF с маленьким шансом
